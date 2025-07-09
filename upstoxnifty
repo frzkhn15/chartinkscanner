@@ -1,0 +1,1011 @@
+import os
+import json
+import csv
+import requests
+import time
+import logging
+from datetime import datetime, timedelta
+import pytz
+import argparse
+import signal
+import threading
+import pandas as pd
+import numpy as np
+
+# ─── Chartink Data Extractor (real‐call) ────────────────────────────────────────────
+#
+# Adapted from workingchartinkhistorical.py. You must supply your own Chartink session
+# cookies and headers here so that the POST requests to Chartink's OAPI actually work.
+
+class ChartInkDataExtractor:
+    def __init__(self):
+        self.base_url = "https://chartink.com/oapi"
+        self.session = requests.Session()
+        self.lock = threading.Lock()
+        
+        # ── IMPORTANT: Update these headers & cookies with values from your Chartink browser session ──
+        self.headers = {
+            "accept": "application/json, text/plain, */*",
+            "accept-language": "en-US,en;q=0.9",
+            "content-type": "application/x-www-form-urlencoded",
+            "origin": "https://chartink.com",
+            "referer": "https://chartink.com/stocks-new",
+            # Use a valid User-Agent from a browser where you're logged into Chartink
+            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko)"
+        }
+        
+        # ── IMPORTANT: Replace these with your own Chartink cookies (obtained via browser dev tools) ──
+        self.cookies = {
+            "_ga": "GA1.2.1533223166.1742236648",
+            "_cc_id": "c6ecc787c8c1803e4a38a7f85b8adbc2",
+            "XSRF-TOKEN": "eyJpdiI6InU2RTFidS8xK3dUbVE4RUJ6NjZlMWc9PSIsInZhbHVlIjoieFg1Y3dxdXIzclZZN1N1UkdrMnpxR0hzcHcxeDZ6VklTeGJERXIwQjZtUGp6MXVKR3FzSStVQllIL1dWRHVWKytFVno4Q1N6VXEwYlFuVyttRDIxc3p0WUdnd0dtaEd5azFjVXVwQ01MKzBYMStRNlBDU1FGVmFoQjFsc1FXdW8iLCJtYWMiOiI0NWJkZjlmMTg1NzA1NDM1ZjAyODJkYTkxMDAyMzBiOTdlNzEzYzdlMTgxYTU5YjZkNTVkNzJkZGY1Yzc3OTczIiwidGFnIjoiIn0=",
+            "ci_session": "eyJpdiI6ImFYNjN4OFR2Z09tbnR4OHVuYnlIeXc9PSIsInZhbHVlIjoiVUN4ZHNySnVtWkhzd0FZZUEvdTdxcVI4V2M3Z09ISHJFYjlQWmhlYnl5SkVaV0wwcUxyVEtPV1NBTHpINVFNRmNDVk91cW5KWDg4dUdBU2cxVmJSL3VXYWF5MXZCNlJCcEF0bkcrOXNlY3o5VkRjQm50NU5PcERYRE91YWdnclciLCJtYWMiOiI5N2M0MTEwN2U2ZTAxZTlhNGFiNTdmZmY5ZTZhMDE3OTI4ZjhlOWJjN2Y1YmMwZTA2YTA1NjEyNzliODU1Mzc3IiwidGFnIjoiIn0="
+        }
+        # Chartink expects an XSRF‐token header matching the cookie:
+        self.headers["x-xsrf-token"] = self.cookies["XSRF-TOKEN"]
+    
+    def fetch_single_column(self, symbol, indicator_name, alias, timeframe="5 minutes", limit=500):
+        """
+        Fetch a single column/indicator via Chartink's oapi endpoint:
+          - indicator_name: e.g. "open", "high", "low", "close", "volume"
+          - alias: the name you want in the DataFrame (e.g. "open", "high", etc.)
+        Returns a pandas.DataFrame indexed by timestamp with one column [alias].
+        """
+        try:
+            query = f"select {indicator_name} as '{alias}' where symbol='{symbol}'"
+            payload = {
+                "query": query,
+                "use_live": "1",
+                "limit": str(limit),
+                "size": str(limit),
+                "end_time": "-1",
+                "timeframe": timeframe,
+                "symbol": symbol,
+                "scan_link": "null"
+            }
+            
+            logger.info(f"Fetching column '{indicator_name}' -> '{alias}' for {symbol}")
+            response = self.session.post(
+                self.base_url,
+                headers=self.headers,
+                cookies=self.cookies,
+                data=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if "metaData" in data and "groupData" in data:
+                return self._parse_single_column_response(data, alias)
+            else:
+                logger.error(f"Unexpected API response for {indicator_name}: {data}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error fetching {indicator_name} for {symbol}: {e}")
+            return None
+    
+    def _parse_single_column_response(self, data, expected_alias):
+        """
+        Parse Chartink's single‐column response. Returns a DataFrame with:
+            index = timestamps (pandas.DatetimeIndex)
+            column = [expected_alias]
+        """
+        try:
+            meta_data = data["metaData"][0]
+            group_data = data["groupData"][0]
+            trade_times = meta_data["tradeTimes"]
+            results = group_data["results"][0]
+            
+            available_keys = list(results.keys())
+            if not available_keys:
+                logger.error(f"No data keys found for '{expected_alias}'")
+                return None
+            
+            actual_key = available_keys[0]
+            values = results[actual_key]
+            
+            if not values or len(values) == 0:
+                logger.warning(f"No values returned for '{expected_alias}'")
+                return None
+            
+            # Build DataFrame
+            min_length = min(len(trade_times), len(values))
+            df = pd.DataFrame({
+                expected_alias: values[:min_length],
+                "timestamp": pd.to_datetime(trade_times[:min_length], unit="ms")
+            })
+            df.set_index("timestamp", inplace=True)
+            df = df.sort_index()
+            
+            logger.info(f"✓ Fetched '{expected_alias}': {len(df)} rows")
+            return df
+        except Exception as e:
+            logger.error(f"Error parsing response for '{expected_alias}': {e}")
+            return None
+    
+    def fetch_multiple_columns_sequential(self, symbol, columns_config, timeframe="5 minutes", limit=500):
+        """
+        Fetch multiple columns (OHLCV) one after another. 
+        columns_config: list of tuples [(indicator_name, alias), ...]
+        Returns a list of DataFrames (one per alias). You will need to combine them afterward.
+        """
+        dataframes = []
+        for indicator_name, alias in columns_config:
+            df = self.fetch_single_column(symbol, indicator_name, alias, timeframe, limit)
+            if df is not None:
+                dataframes.append(df)
+            time.sleep(0.5)  # small delay to respect rate limits
+        return dataframes
+    
+    def combine_dataframes(self, dfs):
+        """
+        Take a list of single‐column DataFrames (all indexed by timestamp) 
+        and join them into one DataFrame. Returns combined DataFrame.
+        """
+        if not dfs:
+            logger.error("No DataFrames to combine")
+            return None
+        
+        combined = dfs[0].copy()
+        for df in dfs[1:]:
+            combined = combined.join(df, how="outer")
+        
+        combined.sort_index(inplace=True)
+        combined.dropna(how="all", inplace=True)
+        logger.info(f"Combined DataFrame: {combined.shape[0]} rows, {combined.shape[1]} cols")
+        return combined
+
+
+# ─── ChartinkAPI (wrapper) ────────────────────────────────────────────────────────
+
+class ChartinkAPI:
+    """
+    Wrapper around ChartInkDataExtractor that returns raw lists of dicts for historical OHLCV.
+    The final.py logic will then calculate indicators locally.
+    """
+    def __init__(self):
+        self.extractor = ChartInkDataExtractor()
+    
+    def fetch_data(self, symbol, timeframe="5 minutes", query=None, size=500, limit=500, use_live=1):
+        """
+        Fetch raw OHLCV from Chartink for the given symbol.
+        Ignores 'query' parameter here (we only want open,high,low,close,volume).
+        Returns:
+            { 'success': True, 'data': [ { 'open': ..., 'high': ..., 'low': ..., 'close': ..., 'volume': ... }, ... ] }
+        or
+            { 'success': False, 'error': '...' }
+        """
+        try:
+            # Define the five OHLCV columns:
+            columns_config = [
+                ("open", "open"),
+                ("high", "high"),
+                ("low", "low"),
+                ("close", "close"),
+                ("volume", "volume")
+            ]
+            
+            dfs = self.extractor.fetch_multiple_columns_sequential(
+                symbol=symbol,
+                columns_config=columns_config,
+                timeframe=timeframe,
+                limit=size
+            )
+            if not dfs or len(dfs) < len(columns_config):
+                return { 'success': False, 'error': "Failed to fetch all OHLCV columns", 'data': [] }
+            
+            combined_df = self.extractor.combine_dataframes(dfs)  # DataFrame indexed by timestamp
+            if combined_df is None or combined_df.empty:
+                return { 'success': False, 'error': "No data returned from Chartink", 'data': [] }
+            
+            # Convert to list of dicts (oldest→newest). We only need raw open,high,low,close,volume.
+            records = []
+            for _, row in combined_df.iterrows():
+                records.append({
+                    'open': float(row['open']),
+                    'high': float(row['high']),
+                    'low': float(row['low']),
+                    'close': float(row['close']),
+                    'volume': float(row['volume'])
+                })
+            
+            return { 'success': True, 'data': records }
+        except Exception as e:
+            logger.error(f"Error in ChartinkAPI.fetch_data: {e}")
+            return { 'success': False, 'error': str(e), 'data': [] }
+
+
+# ─── Logging & Configuration ─────────────────────────────────────────────────────
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('bank_nifty_strategy.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Upstox API configuration (unchanged)
+BASE_URL = "https://api.upstox.com/v2"
+API_KEY = os.getenv("UPSTOX_API_KEY", "3e3e6cd7-8836-4f4e-8613-76b83075a7ca")
+ACCESS_TOKEN = os.getenv("UPSTOX_ACCESS_TOKEN", "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiIyMkM4REwiLCJqdGkiOiI2ODY0ZTdkMDdkZjllNTE1YWMzMDE2YTMiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6ZmFsc2UsImlhdCI6MTc1MTQ0MzQwOCwiaXNzIjoidWRhcGktZ2F0ZXdheS1zZXJ2aWNlIiwiZXhwIjoxNzUxNDkzNjAwfQ.xE5MVo7wjDMsLrvsTyr2seyU5adAFhy2kHaXZN_U1Os")
+HEADERS = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "Authorization": f"Bearer {ACCESS_TOKEN}"
+}
+
+# Trading Config - CHANGED: dry_run is now False by default (live orders)
+TRADING_CONFIG = {
+    "order_type": "MARKET",
+    "product": "I",
+    "num_lots": 1,
+    "price": None,
+    "trigger_price": None,
+    "auto_retry": True,
+    "max_retries": 3,
+    "retry_delay": 5,
+    "dry_run": False,  # CHANGED: Now False by default for live orders
+}
+
+# Default indices
+DEFAULT_INDICES = [
+    {
+        "instrument_key": "NSE_INDEX|Nifty Bank",
+        "name": "Bank Nifty",
+        "chartink_symbol": "BANKNIFTY"
+    },
+    {
+        "instrument_key": "NSE_INDEX|Nifty 50",
+        "name": "Nifty 50",
+        "chartink_symbol": "NIFTY"
+    }
+]
+
+# Strategy parameters (unchanged)
+STRATEGY_PARAMS = {
+    "ema_period": 9,
+    "bb_period": 20,
+    "bb_std_dev": 2,
+    "min_candles_history": 30,
+}
+
+# Globals
+running = True
+current_5min_data = {}
+historical_data = {}
+current_position = {}
+chartink_api = None
+
+# ─── Helper Functions (updated with S/R implementation) ─────────────
+
+def get_index_data(instrument_key, index_name):
+    """
+    Fetch the price data for a given index (Upstox quotes).
+    """
+    url = f"{BASE_URL}/market-quote/quotes"
+    params = {"instrument_key": instrument_key}
+    try:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=10)
+        resp.raise_for_status()
+        payload = resp.json()
+        data_dict = payload.get("data", {})
+        if not data_dict:
+            raise ValueError("No data found in response")
+        first_entry = next(iter(data_dict.values()))
+        last_price = first_entry.get("last_price")
+        ohlc = first_entry.get("ohlc", {})
+        open_price = ohlc.get("open", first_entry.get("open"))
+        high_price = ohlc.get("high", first_entry.get("high"))
+        low_price = ohlc.get("low", first_entry.get("low"))
+        close_price = last_price
+        timestamp = datetime.now(pytz.timezone('Asia/Kolkata'))
+        return {
+            "index": index_name,
+            "timestamp": timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "last_price": last_price
+        }
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Network error fetching {index_name} data: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching {index_name} data: {e}")
+        return None
+
+def is_market_open():
+    """
+    Check if the market is currently open (9:15 AM to 3:30 PM IST, Mon−Fri).
+    """
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    # Weekday: Mon=0, Sun=6
+    if now.weekday() >= 7:  # Saturday=5, Sunday=6
+        return False
+    open_time = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    close_time = now.replace(hour=23, minute=50, second=0, microsecond=0)
+    return open_time <= now <= close_time
+
+def create_csv_file(index_name):
+    """
+    Create or open a CSV file for today's 5‐minute data.
+    """
+    today = datetime.now().strftime('%Y%m%d')
+    filename = f"{index_name.replace(' ', '_').lower()}_{today}_5min.csv"
+    if os.path.exists(filename):
+        logger.info(f"CSV file {filename} exists—appending.")
+    else:
+        with open(filename, 'w', newline='') as csvfile:
+            fieldnames = [
+                'timestamp', 'interval_start', 'interval_end',
+                'open', 'high', 'low', 'close', 'volume',
+                'ema9', 'bb_upper', 'bb_middle', 'bb_lower', 'signal',
+                'nearest_support', 'nearest_resistance', 'signal_strength', 'signal_reasons'
+            ]
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            logger.info(f"Created new CSV: {filename}")
+    return filename
+
+def append_to_csv(filename, data):
+    """
+    Append one 5‐minute row to CSV.
+    """
+    with open(filename, 'a', newline='') as csvfile:
+        fieldnames = [
+            'timestamp', 'interval_start', 'interval_end',
+            'open', 'high', 'low', 'close', 'volume',
+            'ema9', 'bb_upper', 'bb_middle', 'bb_lower', 'signal',
+            'nearest_support', 'nearest_resistance', 'signal_strength', 'signal_reasons'
+        ]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writerow(data)
+    logger.info(f"Appended row to {filename}: {data['interval_start']} → {data['interval_end']}")
+
+def get_next_interval(minute_interval=5):
+    """
+    Compute the next 5‐minute candle boundary and seconds until then.
+    """
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    minutes_past = now.minute % minute_interval
+    seconds_past = now.second
+    seconds_to_next = ((minute_interval - minutes_past) * 60) - seconds_past
+    next_interval = now + timedelta(seconds=seconds_to_next)
+    return next_interval, seconds_to_next
+
+def process_tick_data(index_name, tick_data):
+    """
+    Update current 5‐minute OHLC as new ticks arrive.
+    """
+    global current_5min_data
+    if index_name not in current_5min_data:
+        current_5min_data[index_name] = {
+            'open': tick_data['last_price'],
+            'high': tick_data['last_price'],
+            'low': tick_data['last_price'],
+            'close': tick_data['last_price'],
+            'volume': 0,
+            'timestamp': datetime.now(pytz.timezone('Asia/Kolkata'))
+        }
+    else:
+        current_5min_data[index_name]['high'] = max(
+            current_5min_data[index_name]['high'],
+            tick_data['last_price']
+        )
+        current_5min_data[index_name]['low'] = min(
+            current_5min_data[index_name]['low'],
+            tick_data['last_price']
+        )
+        current_5min_data[index_name]['close'] = tick_data['last_price']
+
+def create_empty_dataframe():
+    return pd.DataFrame(columns=[
+        'open','high','low','close','volume','ema9','bb_upper','bb_middle','bb_lower'
+    ])
+
+def ensure_indicators(df):
+    """
+    Given a DataFrame with columns ['open','high','low','close','volume'], 
+    calculate ema9, bb_upper, bb_middle, bb_lower locally and return the DataFrame.
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+    df['ema9'] = df['close'].ewm(span=STRATEGY_PARAMS['ema_period'], adjust=False).mean()
+    period = STRATEGY_PARAMS['bb_period']
+    std_dev = STRATEGY_PARAMS['bb_std_dev']
+    rolling_mean = df['close'].rolling(window=period).mean()
+    rolling_std = df['close'].rolling(window=period).std()
+    df['bb_upper'] = rolling_mean + (rolling_std * std_dev)
+    df['bb_middle'] = rolling_mean
+    df['bb_lower'] = rolling_mean - (rolling_std * std_dev)
+    logger.debug("Calculated EMA9 and Bollinger Bands locally.")
+    return df
+
+def fetch_historical_data_chartink(chartink_symbol, period_days=2):
+    """
+    Replace the mock generator with a real call to ChartinkAPI.fetch_data.
+    That returns a list of dicts; convert to DataFrame and calculate indicators.
+    """
+    global chartink_api
+    try:
+        logger.info(f"Fetching historical data for {chartink_symbol} from Chartink.")
+        if chartink_api is None:
+            chartink_api = ChartinkAPI()
+        
+        # We request size=500 to get ~500 candles (5-minute) → ~500*5min ≈ ~41 hours of history.
+        response = chartink_api.fetch_data(
+            symbol=chartink_symbol,
+            timeframe='5 minutes',
+            query=None,
+            size=500,
+            limit=500,
+            use_live=1
+        )
+        if not response['success']:
+            logger.error(f"Chartink fetch failed: {response.get('error')}")
+            return create_empty_dataframe()
+        
+        raw = response['data']
+        if not raw:
+            logger.warning(f"No historical rows returned for {chartink_symbol}.")
+            return create_empty_dataframe()
+        
+        # Convert list of dicts to DataFrame and assign a 5-minute DateTimeIndex ending now.
+        df = pd.DataFrame(raw)
+        # Generate timestamps: end at now, step = 5 minutes, length = len(df)
+        end_time = datetime.now(pytz.timezone('Asia/Kolkata'))
+        idx = pd.date_range(end=end_time, periods=len(df), freq='5min')
+        df.index = idx
+        df = df.sort_index()
+        
+        # Calculate indicators locally
+        df = ensure_indicators(df)
+        logger.info(f"Fetched and computed indicators for {len(df)} candles of {chartink_symbol}.")
+        return df
+    except Exception as e:
+        logger.error(f"Error in fetch_historical_data_chartink: {e}")
+        return create_empty_dataframe()
+
+def calculate_support_resistance(df, lookback=20, min_touches=2):
+    """
+    Identify support and resistance levels from historical data.
+    Returns dict with support/resistance levels and their strength.
+    """
+    if len(df) < lookback * 2:
+        return {'support_levels': [], 'resistance_levels': []}
+    
+    # Get recent highs and lows
+    highs = df['high'].rolling(window=lookback, center=True).max()
+    lows = df['low'].rolling(window=lookback, center=True).min()
+    
+    # Find pivot points
+    pivot_highs = []
+    pivot_lows = []
+    
+    for i in range(lookback, len(df) - lookback):
+        if df['high'].iloc[i] == highs.iloc[i]:
+            pivot_highs.append((i, df['high'].iloc[i]))
+        if df['low'].iloc[i] == lows.iloc[i]:
+            pivot_lows.append((i, df['low'].iloc[i]))
+    
+    # Group similar levels (within 0.5% of each other)
+    def group_levels(levels, tolerance=0.005):
+        if not levels:
+            return []
+        
+        grouped = []
+        levels.sort(key=lambda x: x[1])  # Sort by price
+        
+        current_group = [levels[0]]
+        
+        for level in levels[1:]:
+            if abs(level[1] - current_group[-1][1]) / current_group[-1][1] <= tolerance:
+                current_group.append(level)
+            else:
+                if len(current_group) >= min_touches:
+                    avg_price = sum(l[1] for l in current_group) / len(current_group)
+                    grouped.append({
+                        'price': avg_price,
+                        'touches': len(current_group),
+                        'strength': len(current_group) * 10  # Simple strength calculation
+                    })
+                current_group = [level]
+        
+        # Don't forget the last group
+        if len(current_group) >= min_touches:
+            avg_price = sum(l[1] for l in current_group) / len(current_group)
+            grouped.append({
+                'price': avg_price,
+                'touches': len(current_group),
+                'strength': len(current_group) * 10
+            })
+        
+        return grouped
+    
+    support_levels = group_levels(pivot_lows)
+    resistance_levels = group_levels(pivot_highs)
+    
+    # Sort by strength (strongest first)
+    support_levels.sort(key=lambda x: x['strength'], reverse=True)
+    resistance_levels.sort(key=lambda x: x['strength'], reverse=True)
+    
+    return {
+        'support_levels': support_levels[:5],  # Top 5 support levels
+        'resistance_levels': resistance_levels[:5]  # Top 5 resistance levels
+    }
+
+def generate_trade_signal_with_sr(df, current_position=None):
+    """
+    Enhanced signal generation incorporating support/resistance levels.
+    """
+    if len(df) < 2:
+        return "NEUTRAL", {}
+    
+    # Get current price and previous price
+    curr_close = df['close'].iloc[-1]
+    prev_close = df['close'].iloc[-2]
+    
+    # Calculate S/R levels
+    sr_data = calculate_support_resistance(df)
+    support_levels = sr_data['support_levels']
+    resistance_levels = sr_data['resistance_levels']
+    
+    # Original EMA/BB signals
+    curr_ema9 = df['ema9'].iloc[-1]
+    prev_ema9 = df['ema9'].iloc[-2]
+    curr_bb_middle = df['bb_middle'].iloc[-1]
+    prev_bb_middle = df['bb_middle'].iloc[-2]
+    
+    if pd.isna(curr_ema9) or pd.isna(prev_ema9) or pd.isna(curr_bb_middle) or pd.isna(prev_bb_middle):
+        return "NEUTRAL", {'support_levels': support_levels, 'resistance_levels': resistance_levels}
+    
+    # S/R analysis
+    signal_strength = 0
+    signal_type = "NEUTRAL"
+    signal_reason = []
+    
+    # Check proximity to support/resistance (within 0.2%)
+    tolerance = 0.002
+    
+    # Find nearest support and resistance
+    nearest_support = None
+    nearest_resistance = None
+    
+    for support in support_levels:
+        if abs(curr_close - support['price']) / curr_close <= tolerance:
+            nearest_support = support
+            break
+    
+    for resistance in resistance_levels:
+        if abs(curr_close - resistance['price']) / curr_close <= tolerance:
+            nearest_resistance = resistance
+            break
+    
+    # Support level bounce (BUY signal)
+    if nearest_support:
+        if prev_close < nearest_support['price'] and curr_close >= nearest_support['price']:
+            signal_type = "BUY"
+            signal_strength += nearest_support['strength']
+            signal_reason.append(f"Support bounce at {nearest_support['price']:.2f}")
+    
+    # Resistance level rejection (SELL signal)
+    if nearest_resistance:
+        if prev_close > nearest_resistance['price'] and curr_close <= nearest_resistance['price']:
+            signal_type = "SELL"
+            signal_strength += nearest_resistance['strength']
+            signal_reason.append(f"Resistance rejection at {nearest_resistance['price']:.2f}")
+    
+    # Breakout signals
+    breakout_tolerance = 0.001  # 0.1% beyond S/R level
+    
+    # Resistance breakout (strong BUY)
+    for resistance in resistance_levels[:2]:  # Check top 2 resistance levels
+        if (prev_close <= resistance['price'] and 
+            curr_close > resistance['price'] * (1 + breakout_tolerance)):
+            signal_type = "BUY"
+            signal_strength += resistance['strength'] * 1.5  # Breakouts get higher weight
+            signal_reason.append(f"Resistance breakout above {resistance['price']:.2f}")
+            break
+    
+    # Support breakdown (strong SELL)
+    for support in support_levels[:2]:  # Check top 2 support levels
+        if (prev_close >= support['price'] and 
+            curr_close < support['price'] * (1 - breakout_tolerance)):
+            signal_type = "SELL"
+            signal_strength += support['strength'] * 1.5
+            signal_reason.append(f"Support breakdown below {support['price']:.2f}")
+            break
+    
+    # Combine with EMA/BB signals for confirmation
+    cross_above_ema = (prev_close <= prev_ema9) and (curr_close > curr_ema9)
+    cross_below_ema = (prev_close >= prev_ema9) and (curr_close < curr_ema9)
+    above_bb_middle = curr_close >= curr_bb_middle
+    below_bb_middle = curr_close <= curr_bb_middle
+    
+    # EMA/BB confirmation
+    if signal_type == "BUY" and cross_above_ema and above_bb_middle:
+        signal_strength += 20
+        signal_reason.append("EMA/BB confirmation")
+    elif signal_type == "SELL" and cross_below_ema and below_bb_middle:
+        signal_strength += 20
+        signal_reason.append("EMA/BB confirmation")
+    elif signal_type == "NEUTRAL":
+        # Original EMA/BB signals if no S/R signals
+        if cross_above_ema and above_bb_middle:
+            signal_type = "BUY"
+            signal_strength = 15
+            signal_reason.append("EMA/BB bullish crossover")
+        elif cross_below_ema and below_bb_middle:
+            signal_type = "SELL"
+            signal_strength = 15
+            signal_reason.append("EMA/BB bearish crossover")
+    
+    # Minimum signal strength threshold
+    if signal_strength < 10:
+        signal_type = "NEUTRAL"
+    
+    return signal_type, {
+        'support_levels': support_levels,
+        'resistance_levels': resistance_levels,
+        'signal_strength': signal_strength,
+        'signal_reason': signal_reason,
+        'nearest_support': nearest_support,
+        'nearest_resistance': nearest_resistance
+    }
+
+def generate_5min_candle(index_name, chartink_symbol):
+    """
+    Called at each 5‐minute boundary. Builds a new candle from current_5min_data,
+    appends to historical_data, recalculates indicators, potentially sends an order.
+    """
+    global current_5min_data, historical_data, current_position
+    
+    if index_name not in current_5min_data:
+        logger.warning(f"No tick data for {index_name}, skipping 5-min candle.")
+        return
+    
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    minutes_past = now.minute % 5
+    interval_end = now.replace(second=0, microsecond=0)
+    interval_start = interval_end - timedelta(minutes=5)
+    
+    # Initialize historical if needed
+    if index_name not in historical_data or historical_data[index_name].empty:
+        df_hist = fetch_historical_data_chartink(chartink_symbol)
+        historical_data[index_name] = df_hist
+    
+    # Build new candle dict
+    odo = current_5min_data[index_name]
+    new_candle = {
+        'timestamp': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'interval_start': interval_start.strftime('%Y-%m-%d %H:%M:%S'),
+        'interval_end': interval_end.strftime('%Y-%m-%d %H:%M:%S'),
+        'open': odo['open'],
+        'high': odo['high'],
+        'low': odo['low'],
+        'close': odo['close'],
+        'volume': odo['volume']
+    }
+    # Append to historical_data DataFrame
+    new_row = pd.DataFrame([{
+        'open': odo['open'],
+        'high': odo['high'],
+        'low': odo['low'],
+        'close': odo['close'],
+        'volume': odo['volume'],
+        'ema9': np.nan,
+        'bb_upper': np.nan,
+        'bb_middle': np.nan,
+        'bb_lower': np.nan
+    }], index=[pd.Timestamp(now)])
+    
+    hist_df = historical_data[index_name].copy()
+    hist_df = pd.concat([hist_df, new_row])
+    if len(hist_df) > 1000:
+        hist_df = hist_df.tail(1000)
+    hist_df = ensure_indicators(hist_df)
+    historical_data[index_name] = hist_df
+    
+    # Generate trading signal with S/R analysis
+    if len(hist_df) < STRATEGY_PARAMS['min_candles_history']:
+        signal = "WAIT_FOR_DATA"
+        sr_info = {}
+        logger.info(f"Collecting data for {index_name}: {len(hist_df)}/{STRATEGY_PARAMS['min_candles_history']} candles.")
+    else:
+        if index_name not in current_position:
+            current_position[index_name] = "FLAT"
+        signal, sr_info = generate_trade_signal_with_sr(hist_df, current_position[index_name])
+        
+        # Enhanced logging with S/R info
+        if sr_info.get('signal_reason'):
+            logger.info(f"Signal reasons: {', '.join(sr_info['signal_reason'])}")
+            logger.info(f"Signal strength: {sr_info.get('signal_strength', 0)}")
+
+        # Log current S/R levels
+        if sr_info.get('support_levels'):
+            support_prices = [f"{s['price']:.2f}({s['touches']})" for s in sr_info['support_levels'][:3]]
+            logger.info(f"Key supports: {', '.join(support_prices)}")
+
+        if sr_info.get('resistance_levels'):
+            resistance_prices = [f"{r['price']:.2f}({r['touches']})" for r in sr_info['resistance_levels'][:3]]
+            logger.info(f"Key resistances: {', '.join(resistance_prices)}")
+        
+        if signal == "BUY" and current_position[index_name] != "LONG":
+            logger.info(f"🟢 BUY SIGNAL for {index_name} — placing order.")
+            if not TRADING_CONFIG['dry_run']:
+                place_order(index_name, "BUY")
+            current_position[index_name] = "LONG"
+        elif signal == "SELL" and current_position[index_name] != "SHORT":
+            logger.info(f"🔴 SELL SIGNAL for {index_name} — placing order.")
+            if not TRADING_CONFIG['dry_run']:
+                place_order(index_name, "SELL")
+            current_position[index_name] = "SHORT"
+    
+    # Fill indicators & signal for CSV row
+    latest = hist_df.iloc[-1]
+    new_candle['ema9'] = latest.get('ema9', np.nan)
+    new_candle['bb_upper'] = latest.get('bb_upper', np.nan)
+    new_candle['bb_middle'] = latest.get('bb_middle', np.nan)
+    new_candle['bb_lower'] = latest.get('bb_lower', np.nan)
+    new_candle['signal'] = signal
+    
+    # Add S/R data to CSV
+    new_candle['nearest_support'] = sr_info.get('nearest_support', {}).get('price', '') if sr_info.get('nearest_support') else ''
+    new_candle['nearest_resistance'] = sr_info.get('nearest_resistance', {}).get('price', '') if sr_info.get('nearest_resistance') else ''
+    new_candle['signal_strength'] = sr_info.get('signal_strength', 0)
+    new_candle['signal_reasons'] = '; '.join(sr_info.get('signal_reason', []))
+    
+    # Write to CSV
+    filename = create_csv_file(index_name)
+    append_to_csv(filename, new_candle)
+    
+    # Reset current_5min_data for next candle
+    last_close = current_5min_data[index_name]['close']
+    current_5min_data[index_name] = {
+        'open': last_close,
+        'high': last_close,
+        'low': last_close,
+        'close': last_close,
+        'volume': 0,
+        'timestamp': now
+    }
+    
+    # Log a prettified status block with S/R info
+    try:
+        ema9_val = new_candle['ema9'] if not pd.isna(new_candle['ema9']) else 0.0
+        bb_upper_val = new_candle['bb_upper'] if not pd.isna(new_candle['bb_upper']) else 0.0
+        bb_middle_val = new_candle['bb_middle'] if not pd.isna(new_candle['bb_middle']) else 0.0
+        bb_lower_val = new_candle['bb_lower'] if not pd.isna(new_candle['bb_lower']) else 0.0
+        
+        nearest_sup = new_candle['nearest_support'] if new_candle['nearest_support'] else 'None'
+        nearest_res = new_candle['nearest_resistance'] if new_candle['nearest_resistance'] else 'None'
+        
+        status_info = f"""
+╔══════════════════════════════════════════════════════════════════╗
+║ INDEX STATUS: {index_name:<47} ║
+╠══════════════════════════════════════════════════════════════════╣
+║ Time:          {now.strftime('%H:%M:%S'):<47} ║
+║ Current Price: {last_close:>8.2f}{'':<37} ║
+║ EMA9:          {ema9_val:>8.2f}{'':<37} ║
+║ BB Upper:      {bb_upper_val:>8.2f}{'':<37} ║
+║ BB Middle:     {bb_middle_val:>8.2f}{'':<37} ║
+║ BB Lower:      {bb_lower_val:>8.2f}{'':<37} ║
+║ Near Support:  {str(nearest_sup):<47} ║
+║ Near Resist:   {str(nearest_res):<47} ║
+║ Signal:        {signal:<47} ║
+║ Strength:      {new_candle['signal_strength']:<47} ║
+║ Position:      {current_position.get(index_name, 'FLAT'):<47} ║
+╚══════════════════════════════════════════════════════════════════╝
+"""
+        logger.info(status_info)
+    except Exception as e:
+        logger.error(f"Error formatting status block for {index_name}: {e}")
+        logger.info(f"{index_name} — Signal: {signal}, Position: {current_position.get(index_name, 'FLAT')}")
+
+def place_order(instrument_key, transaction_type, order_type="MARKET", quantity=1):
+    """
+    Place actual order via Upstox API when not in dry-run mode.
+    """
+    try:
+        # Map index names to actual tradeable instrument keys
+        instrument_mapping = {
+            "Bank Nifty": "NSE_FO|BANKNIFTY",  # You'll need to specify the actual contract
+            "Nifty 50": "NSE_FO|NIFTY"        # You'll need to specify the actual contract
+        }
+        
+        # Get the tradeable instrument key
+        tradeable_instrument = instrument_mapping.get(instrument_key, instrument_key)
+        
+        # Prepare order payload
+        order_payload = {
+            "quantity": quantity * TRADING_CONFIG["num_lots"],
+            "product": TRADING_CONFIG["product"],
+            "validity": "DAY",
+            "price": TRADING_CONFIG["price"],
+            "tag": "bank_nifty_strategy",
+            "instrument_token": tradeable_instrument,
+            "order_type": order_type,
+            "transaction_type": transaction_type,
+            "disclosed_quantity": 0,
+            "trigger_price": TRADING_CONFIG["trigger_price"],
+            "is_amo": False
+        }
+        
+        # Remove None values
+        order_payload = {k: v for k, v in order_payload.items() if v is not None}
+        
+        url = f"{BASE_URL}/order/place"
+        
+        for attempt in range(TRADING_CONFIG["max_retries"]):
+            try:
+                logger.info(f"Placing {transaction_type} order for {instrument_key} (attempt {attempt + 1})")
+                response = requests.post(url, headers=HEADERS, json=order_payload, timeout=30)
+                response.raise_for_status()
+                
+                result = response.json()
+                if result.get("status") == "success":
+                    order_id = result.get("data", {}).get("order_id")
+                    logger.info(f"✅ Order placed successfully: {order_id}")
+                    return {"status": "success", "data": {"order_id": order_id}}
+                else:
+                    logger.error(f"Order placement failed: {result}")
+                    
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Network error placing order (attempt {attempt + 1}): {e}")
+                if attempt < TRADING_CONFIG["max_retries"] - 1:
+                    time.sleep(TRADING_CONFIG["retry_delay"])
+                    continue
+                else:
+                    return {"status": "error", "error": str(e)}
+            except Exception as e:
+                logger.error(f"Error placing order: {e}")
+                return {"status": "error", "error": str(e)}
+        
+        return {"status": "error", "error": "Max retries exceeded"}
+        
+    except Exception as e:
+        logger.error(f"Error in place_order function: {e}")
+        return {"status": "error", "error": str(e)}
+
+def collect_data_thread(indices, tick_interval=60):
+    """
+    Thread that runs continuously, collecting tick‐by‐tick data once per `tick_interval` seconds,
+    building 5‐minute candles, and triggering generate_5min_candle at each interval.
+    """
+    global running, chartink_api
+    
+    logger.info(f"Starting data‐collection thread (tick every {tick_interval}s).")
+    chartink_api = ChartinkAPI()
+    
+    # Preload historical data for each index
+    for index in indices:
+        sym = index.get("chartink_symbol")
+        name = index["name"]
+        if sym:
+            logger.info(f"Initializing historical data for {name} ({sym})")
+            historical_data[name] = fetch_historical_data_chartink(sym)
+    
+    while running:
+        try:
+            if not is_market_open():
+                logger.info("Market is closed. Sleeping for 60s.")
+                time.sleep(60)
+                continue
+            
+            next_interval, secs_to_next = get_next_interval(5)
+            logger.debug(f"Next 5‐min boundary @ {next_interval.strftime('%H:%M:%S')} ({secs_to_next}s away).")
+            
+            ticks_remaining = max(1, int(secs_to_next / tick_interval))
+            for _ in range(ticks_remaining):
+                if not running:
+                    break
+                for index in indices:
+                    ik = index["instrument_key"]
+                    name = index["name"]
+                    tick = get_index_data(ik, name)
+                    if tick:
+                        process_tick_data(name, tick)
+                        logger.info(f"{name} @ {tick['timestamp']}: Price {tick['last_price']:.2f}")
+                time.sleep(tick_interval)
+            
+            # Build 5-minute candles now
+            for index in indices:
+                name = index["name"]
+                sym = index.get("chartink_symbol")
+                if sym:
+                    generate_5min_candle(name, sym)
+        except Exception as e:
+            logger.error(f"Error in data‐collection thread: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            time.sleep(5)
+
+def signal_handler(sig, frame):
+    """
+    Gracefully stop on Ctrl+C
+    """
+    global running
+    logger.info("Stopping data collection...")
+    running = False
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(
+        description="Bank Nifty Trading Strategy with EMA & Bollinger Bands + Support/Resistance (Chartink Integration)"
+    )
+    parser.add_argument(
+        '--tick-interval', type=float, default=60.0,
+        help='Tick‐interval in seconds (default: 60s)'
+    )
+    parser.add_argument(
+        '--debug', action='store_true',
+        help='Enable DEBUG logging'
+    )
+    parser.add_argument(
+        '--dry-run', action='store_true',
+        help='Enable dry‐run mode (no real orders)'
+    )
+    return parser.parse_args()
+
+# ─── Main ─────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    args = parse_arguments()
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled.")
+    
+    # CHANGED: Now dry-run is opt-in, live trading is default
+    if args.dry_run:
+        TRADING_CONFIG['dry_run'] = True
+        logger.info("Dry‐run mode enabled — no real orders will be placed.")
+    else:
+        logger.warning("🚨 LIVE TRADING MODE — REAL ORDERS WILL BE PLACED 🚨")
+        logger.warning("Press Ctrl+C within 10 seconds to cancel...")
+        try:
+            for i in range(10, 0, -1):
+                print(f"Starting live trading in {i} seconds...", end='\r')
+                time.sleep(1)
+            print("\n🔥 LIVE TRADING STARTED 🔥")
+        except KeyboardInterrupt:
+            logger.info("Trading cancelled by user.")
+            exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    
+    logger.info("=" * 60)
+    logger.info("Bank Nifty Trading Strategy with EMA & Bollinger Bands + S/R (Chartink)")
+    logger.info("=" * 60)
+    logger.info(f"Trading Mode: {'DRY RUN' if TRADING_CONFIG['dry_run'] else 'LIVE TRADING'}")
+    logger.info(f"Tick interval: {args.tick_interval}s")
+    logger.info(f"EMA period: {STRATEGY_PARAMS['ema_period']}")
+    logger.info(f"Bollinger: {STRATEGY_PARAMS['bb_period']} periods, {STRATEGY_PARAMS['bb_std_dev']} σ")
+    logger.info(f"Support/Resistance: Auto-detection enabled")
+    logger.info(f"Data source: Chartink OAPI (real calls)")
+    logger.info(f"Indices: {', '.join([idx['name'] for idx in DEFAULT_INDICES])}")
+    logger.info("=" * 60)
+    
+    collector_thread = threading.Thread(
+        target=collect_data_thread,
+        args=(DEFAULT_INDICES, args.tick_interval)
+    )
+    collector_thread.daemon = True
+    collector_thread.start()
+    
+    # Keep main alive until interrupted
+    try:
+        while running:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        running = False
+    
+    logger.info("Waiting for data‐collection thread to finish...")
+    collector_thread.join(timeout=5)
+    logger.info("Data collection stopped.")
